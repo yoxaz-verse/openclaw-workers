@@ -67,7 +67,7 @@ async function run() {
   while (true) {
     try {
       touchHeartbeat();
-      const next = await fetchJson(`${SERVER_URL}/api/agent/tasks/next`, {
+      const next = await fetchJson(`${SERVER_URL}/agents/tasks/next`, {
         method: 'GET',
         headers: authHeaders(),
       });
@@ -246,7 +246,7 @@ function extractStructuredOutputs(output) {
 }
 
 async function submitResult(taskId, payload) {
-  await fetchJson(`${SERVER_URL}/api/agent/tasks/${taskId}/result`, {
+  await fetchJson(`${SERVER_URL}/agents/tasks/${taskId}/result`, {
     method: 'POST',
     headers: authHeaders(),
     body: JSON.stringify(payload),
