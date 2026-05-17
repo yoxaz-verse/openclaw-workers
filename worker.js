@@ -11,8 +11,10 @@ const WORKER_SECRET = must('WORKER_SECRET');
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
 const OPENCLAW_COMMAND = process.env.OPENCLAW_COMMAND || 'openclaw';
 const OPENCLAW_TIMEOUT_MS = Number(process.env.OPENCLAW_TIMEOUT_MS || 180000);
-const WORKER_EXECUTION_MODE = (process.env.WORKER_EXECUTION_MODE || 'hybrid').toLowerCase();
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim() || '';
+const OPENCLAW_SESSION_ID = process.env.OPENCLAW_SESSION_ID?.trim() || '';
+const OPENCLAW_AGENT = process.env.OPENCLAW_AGENT?.trim() || '';
+const WORKER_EXECUTION_MODE = (process.env.WORKER_EXECUTION_MODE || 'cli').toLowerCase();
+const OPENAI_API_KEY = normalizeOpenAiApiKey(process.env.OPENAI_API_KEY?.trim() || '');
 const OPENAI_MODEL = process.env.OPENAI_MODEL?.trim() || 'gpt-5.4-mini';
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 180000);
 const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || '/tmp/openclaw-worker-heartbeat';
@@ -80,10 +82,35 @@ async function run() {
 
       console.log('[openclaw-worker] picked', { id: task.id, role: task.role_key, type: task.task_type });
       const prompt = buildPrompt(task);
-      const generated = await generateOutput(prompt);
+      let generated;
+      try {
+        generated = await generateOutput(prompt);
+      } catch (error) {
+        const message = shortErrorMessage(error);
+        await submitResult(task.id, {
+          status: 'failed',
+          result: message,
+          structured_outputs: [],
+        });
+        continue;
+      }
 
       const parsed = extractStructuredOutputs(generated.stdout);
       const resultText = parsed.cleanedText || generated.stdout || generated.stderr || 'No output produced';
+      const authFailure = detectAuthFailureText(resultText);
+
+      if (authFailure) {
+        console.warn('[openclaw-worker] classified auth failure output', {
+          taskId: task.id,
+          reason: authFailure.reason,
+        });
+        await submitResult(task.id, {
+          status: 'failed',
+          result: authFailure.userMessage,
+          structured_outputs: [],
+        });
+        continue;
+      }
 
       await submitResult(task.id, {
         status: 'completed',
@@ -103,23 +130,16 @@ async function generateOutput(prompt) {
     return runOpenClawCli(prompt);
   }
 
-  if (WORKER_EXECUTION_MODE === 'api') {
-    return runOpenAiApi(prompt);
-  }
-
-  try {
-    return await runOpenClawCli(prompt);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'CLI mode failed';
-    console.warn('[openclaw-worker] cli failed, falling back to OpenAI API', { message });
-    return runOpenAiApi(prompt);
-  }
+  throw new Error(
+    `Unsupported WORKER_EXECUTION_MODE: ${WORKER_EXECUTION_MODE}. This worker is CLI-only. Set WORKER_EXECUTION_MODE=cli.`
+  );
 }
 
 async function runOpenClawCli(prompt) {
+  const targetArgs = buildOpenClawTargetArgs();
   const response = await execFileAsync(
     OPENCLAW_COMMAND,
-    ['agent', '--message', prompt],
+    ['agent', ...targetArgs, '--message', prompt],
     {
       timeout: OPENCLAW_TIMEOUT_MS,
       maxBuffer: 10 * 1024 * 1024,
@@ -131,6 +151,14 @@ async function runOpenClawCli(prompt) {
     stdout: String(response.stdout || '').trim(),
     stderr: String(response.stderr || '').trim(),
   };
+}
+
+function buildOpenClawTargetArgs() {
+  if (OPENCLAW_AGENT) return ['--agent', OPENCLAW_AGENT];
+  if (OPENCLAW_SESSION_ID) return ['--session-id', OPENCLAW_SESSION_ID];
+  throw new Error(
+    'OpenClaw CLI target is missing. Set OPENCLAW_AGENT (preferred) or OPENCLAW_SESSION_ID.'
+  );
 }
 
 async function runOpenAiApi(prompt) {
@@ -309,16 +337,22 @@ function loadDotEnv() {
 }
 
 function validateConfiguration() {
-  const allowedModes = new Set(['hybrid', 'cli', 'api']);
+  const allowedModes = new Set(['cli']);
   if (!allowedModes.has(WORKER_EXECUTION_MODE)) {
     throw new Error(
-      `Invalid WORKER_EXECUTION_MODE: ${WORKER_EXECUTION_MODE}. Expected one of hybrid|cli|api`
+      `Invalid WORKER_EXECUTION_MODE: ${WORKER_EXECUTION_MODE}. This worker is CLI-only. Use WORKER_EXECUTION_MODE=cli.`
     );
   }
 
-  if ((WORKER_EXECUTION_MODE === 'api' || WORKER_EXECUTION_MODE === 'hybrid') && !OPENAI_API_KEY) {
+  if (!hasOpenClawTarget()) {
+    throw new Error(
+      'OpenClaw target is required. Set OPENCLAW_AGENT (preferred) or OPENCLAW_SESSION_ID before starting worker.'
+    );
+  }
+
+  if (!OPENCLAW_AGENT && OPENCLAW_SESSION_ID) {
     console.warn(
-      '[openclaw-worker] OPENAI_API_KEY is not set; API mode/fallback will fail if CLI is unavailable.'
+      '[openclaw-worker] OPENCLAW_AGENT is not set; using OPENCLAW_SESSION_ID fallback target.'
     );
   }
 }
@@ -330,10 +364,74 @@ function logStartup() {
     WORKER_EXECUTION_MODE,
     OPENCLAW_COMMAND,
     OPENCLAW_TIMEOUT_MS,
+    openclawTargetConfigured: hasOpenClawTarget(),
     OPENAI_MODEL,
     openaiKeyConfigured: Boolean(OPENAI_API_KEY),
     HEARTBEAT_FILE,
   });
+}
+
+function hasOpenClawTarget() {
+  return Boolean(OPENCLAW_AGENT || OPENCLAW_SESSION_ID);
+}
+
+function normalizeOpenAiApiKey(value) {
+  if (!value) return '';
+  const lower = value.toLowerCase();
+  if (lower.includes('replace_with') || lower.includes('replace_') || lower.includes('your_api_key')) {
+    return '';
+  }
+  return value;
+}
+
+function shortErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const compact = message.replace(/\s+/g, ' ').trim();
+  return compact.slice(0, 500) || 'Task execution failed';
+}
+
+function detectAuthFailureText(text) {
+  const normalized = String(text || '').toLowerCase();
+  if (!normalized) return null;
+
+  const directPatterns = [
+    {
+      reason: 'auth_token_invalidated',
+      pattern: /authentication token has been invalidated/,
+    },
+    {
+      reason: 'token_invalid',
+      pattern: /\btoken is invalid\b/,
+    },
+    {
+      reason: 'invalid_auth_token',
+      pattern: /\binvalid authentication token\b/,
+    },
+    {
+      reason: 'reauth_required',
+      pattern: /please try signing in again/,
+    },
+  ];
+
+  for (const entry of directPatterns) {
+    if (entry.pattern.test(normalized)) {
+      return {
+        reason: entry.reason,
+        userMessage: 'Authentication token is invalid or expired for OpenClaw target. Re-authenticate and retry this task.',
+      };
+    }
+  }
+
+  const hasSessionExpired = normalized.includes('session expired');
+  const hasAuthContext = normalized.includes('auth') || normalized.includes('token') || normalized.includes('sign in');
+  if (hasSessionExpired && hasAuthContext) {
+    return {
+      reason: 'session_expired_auth_context',
+      userMessage: 'OpenClaw session expired for the configured target. Re-authenticate and retry this task.',
+    };
+  }
+
+  return null;
 }
 
 function touchHeartbeat() {
